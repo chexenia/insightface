@@ -46,5 +46,6 @@ for scan in scans:
 			for pt in points:
 				cv2.circle(img, (pt[0], pt[1]), 2, (0, 0, 255))
 			cv2.imwrite(outpath + '_mtcnn.png', img)	
-
+	else:
+		print('..failed')
 print ("Time elapsed: ", time.time() - start)
