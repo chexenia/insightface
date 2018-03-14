@@ -21,6 +21,12 @@ import time
 #sys.path.append(os.path.join(os.path.dirname(__file__),'..', 'common'))
 from common import face_image
 import reco2.common as cmn
+import reco2.common as cmn
+import reco2.utilities.landmarks as lm
+from reco2.extensions.common import prepare_centerloss
+from reco2.utilities.utils2d import drawPoints, drawBoxes
+import caffe
+from reco2.extensions.mtcnn.detect_face import initFaceDetector, detect_face
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -35,6 +41,8 @@ def parse_args():
   parser.add_argument('--mean', type=float, default=127.7, help='subtract mean')
   parser.add_argument('--norm_scale', type=float, default=0.0078125, help='scale image after mean subtraction')
   parser.add_argument('--chunks', type=int, default=3, help='number of chunks to split the data to')
+  parser.add_argument('--mtcnn', type=str, help='path to mtcnn model')
+  parser.add_argument('--viz', type=bool, default=False, help='vizualise and save mtcnn results')
   args = parser.parse_args()
   return args
 
@@ -108,13 +116,6 @@ def convert_data_2hdf5(args):
   n_ids = header0[1]-header0[0]
   print('identities',n_ids, 'images', header0[0])
 
-  # id2range = {}
-  # seq_identity = range(int(header.label[0]), int(header.label[1]))
-  # for identity in seq_identity:
-  #   s = imgrec.read_idx(identity)
-  #   header, _ = mx.recordio.unpack(s)
-  #   id2range[identity] = (int(header.label[0]), int(header.label[1]))
-  # print('id2range', len(id2range))
   prop = face_image.load_property(args.data_path)
   image_size = prop.image_size
   print('image_size', image_size)
@@ -131,8 +132,8 @@ def convert_data_2hdf5(args):
 
   n_chunk = 0
   start = int(header.label[0])
-  stop = int(header.label[1])
-  #stop = start + 10
+  #stop = int(header.label[1])
+  stop = start + 10
   splits = np.array_split(range(start, stop), args.chunks)
   for split in splits:
     for identity in split:
@@ -186,16 +187,89 @@ def to_hdf5(dst, data, labels):
 
 def prep_image(img):
   img = mx.image.resize_short(img, args.rescale_size)
-  img = img.asnumpy()[...,::-1]
-  #img = args.norm_scale * (img - args.mean)
+  img = img.asnumpy()#[...,::-1]
+  img = args.norm_scale * (img - args.mean)
   return img
+
+def convert_data_detect(args):
+  path_imgrec = os.path.join(args.data_path, 'train.rec')
+  path_imgidx = os.path.join(args.data_path, 'train.idx')
+  imgrec = mx.recordio.MXIndexedRecordIO(path_imgidx, path_imgrec, 'r')  # pylint: disable=redefined-variable-type
+  s = imgrec.read_idx(0)
+  header, _ = mx.recordio.unpack(s)
+  assert(header.flag>0)
+  print('header0 label', header.label)
+  header0 = (int(header.label[0]), int(header.label[1]))
+  n_ids = header0[1]-header0[0]
+  print('identities',n_ids, 'images', header0[0])
+
+  prop = face_image.load_property(args.data_path)
+  image_size = prop.image_size
+  print('image_size', image_size)
+
+  detector = initFaceDetector(args.mtcnn, gpu=True)
+
+  start = time.time()
+  seq_identity = range(int(header.label[0]), int(header.label[1]))
+
+  pid = 0
+  for identity in seq_identity:
+    s = imgrec.read_idx(identity)
+    header, _ = mx.recordio.unpack(s)
+    print(header)
+
+    pid +=1 
+
+    outpath = os.path.join(args.dst_path, str(header.id))
+    cmn.ensurePath(outpath)
+
+    a, b = int(header.label[0]), int(header.label[1])
+
+    for _idx in range(a,b):
+      s = imgrec.read_idx(_idx)
+      _header, _content = mx.recordio.unpack(s)
+      bgr = mx.image.imdecode(_content, flag=1)
+      bgr = mx.image.resize_short(bgr, args.rescale_size)
+      img = bgr.asnumpy()
+      img = img[...,::-1] #swap brg-rgb
+
+      bboxes, points = detect_face(img, *detector)
+      if len(bboxes) > 0:
+        cv2.imwrite(os.path.join(outpath, "{}_{}_raw.png".format(header.id, _idx)), img)
+        for idx, pts in enumerate(points):
+            #lm.save_ldms2d(outldms.format(idx), pts)
+            #save image prepared for centerloss
+            outcls = os.path.join(outpath, "{}_{}_cls.png".format(header.id, _idx))
+            imcls = prepare_centerloss(img, points[idx], scale=np.array([128./96., 128./112.], dtype=np.float32) )
+            cv2.imwrite(outcls.format(idx), imcls)
+
+        if args.viz:
+          img = img[...,::-1] #???
+          bimg = drawBoxes(img, bboxes)
+          bpimg = drawPoints(bimg, points)
+          cv2.imwrite(os.path.join(outpath, "{}_{}_mtcnn.png".format(header.id, _idx)), bpimg)
+
+    info_path = os.path.join(outpath, 'info.txt')
+    if not os.path.exists(info_path):
+      dtt = datetime.now()
+      dt =time.strftime("%Y%m%dT%H%M%S")# + str(dtt.microsecond)
+      experiment = 'enroll'
+      tags = ''
+      templateuid = str(header.id)
+
+      info = cmn.InfoTxt(pid=pid, info=str(header.id), datatype=cmn.RECO2_DATA_TYPE.IMG, datetime = dt, schemeid='MSCeleb85164', experiment=experiment, tags = tags, templateuid=templateuid)
+      info.save(outpath)
+
+  print ("Time elapsed: ", time.time() - start)
+
 
 def main():
     #time.sleep(3600*6.5)
     global args
     args = parse_args()
     #convert_data(args)
-    convert_data_2hdf5(args)
+    #convert_data_2hdf5(args)
+    convert_data_detect(args)
 
 if __name__ == '__main__':
     main()
